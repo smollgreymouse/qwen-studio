@@ -25,7 +25,10 @@ const configs = {};
 // The Rust side waits 60s for any reply (src/mcp.rs `send`). A single server
 // that never answers `initialize` must not eat that whole budget, so every
 // handshake gets its own, smaller deadline and servers connect concurrently.
-const CONNECT_TIMEOUT_MS = 15000;
+// 30s: `npx -y pkg@latest` resolves the version through the npm registry, and
+// on a cold start (4 servers spawning in parallel while the app itself is
+// still booting) 15s was not enough — Filesystem intermittently timed out.
+const CONNECT_TIMEOUT_MS = 30000;
 
 function log(msg) {
   process.stderr.write(`[mcp-bridge] ${msg}\n`);
@@ -118,15 +121,27 @@ async function callTool(params) {
 
 async function disconnectAll() {
   log("disconnecting all servers");
+  const pending = [];
   for (const [name, client] of clients) {
-    try {
-      await client.close();
-      log(`disconnected: ${name}`);
-    } catch (e) {
-      log(`disconnect error ${name}: ${e.message}`);
-    }
+    pending.push(
+      (async () => {
+        try {
+          await client.close();
+          log(`disconnected: ${name}`);
+        } catch (e) {
+          log(`disconnect error ${name}: ${e.message}`);
+        }
+      })()
+    );
   }
+  // Wait for every child to actually shut down before clearing the map. On
+  // Windows killing npx.cmd/uvx does NOT cascade to its node grandchildren, so
+  // closing concurrently is not enough — a fresh spawn racing the dying child
+  // is what made Filesystem/Sequential-Thinking intermittently time out.
+  await Promise.all(pending);
   clients.clear();
+  // Give the OS a beat to release process/pipe handles before the next spawn.
+  await new Promise((resolve) => setTimeout(resolve, 300));
 }
 
 const rl = createInterface({
@@ -166,19 +181,67 @@ rl.on("line", async (line) => {
       case "getConfig":
         result = structuredClone(configs);
         break;
-      case "updateConfig":
-        await disconnectAll();
-        Object.assign(configs, params.config || {});
-        // Concurrent on purpose: a hung server then costs a single
-        // CONNECT_TIMEOUT_MS instead of stalling every healthy server queued
-        // behind it.
-        await Promise.allSettled(
-          Object.entries(configs).map(([name, cfg]) =>
-            connect({ serverName: name, config: cfg })
-          )
+      case "updateConfig": {
+        const incoming = params.config || {};
+        // Diff against the live config instead of a full disconnect+reconnect.
+        // Reconnecting unchanged servers (e.g. Filesystem when the UI only
+        // edits qwen-core) is what intermittently turned healthy servers red:
+        // killing npx.cmd/uvx does not reap its node grandchildren, so a fresh
+        // spawn raced the dying child and timed out.
+        const removed = Object.keys(configs).filter((n) => !(n in incoming));
+        const changed = Object.keys(incoming).filter((n) => {
+          if (!(n in configs)) return true; // newly added
+          return JSON.stringify(configs[n]) !== JSON.stringify(incoming[n]);
+        });
+        const reconnect = [...removed, ...changed];
+        const unchanged = Object.keys(incoming).filter((n) => !reconnect.includes(n));
+
+        // Close only the servers being removed or replaced.
+        for (const name of reconnect) {
+          const client = clients.get(name);
+          if (!client) continue;
+          try {
+            await client.close();
+            log(`disconnected: ${name}`);
+          } catch (e) {
+            log(`disconnect error ${name}: ${e.message}`);
+          }
+          clients.delete(name);
+        }
+        if (reconnect.length > 0) {
+          // Give the OS a beat to release handles from the closed children.
+          await new Promise((resolve) => setTimeout(resolve, 300));
+        }
+
+        Object.assign(configs, incoming);
+
+        // Reconnect only what changed (concurrently, so a single hung server
+        // still costs one CONNECT_TIMEOUT_MS rather than stalling the rest).
+        const settled = await Promise.allSettled(
+          reconnect.map((name) => connect({ serverName: name, config: incoming[name] }))
         );
-        result = structuredClone(configs);
+        const statuses = {};
+        settled.forEach((res, i) => {
+          const name = reconnect[i];
+          if (res.status === "fulfilled") {
+            statuses[name] = { status: "connected" };
+          } else {
+            statuses[name] = { status: "failed", error: String(res.reason?.message || res.reason) };
+          }
+        });
+        // Unchanged servers keep their existing live status.
+        for (const name of unchanged) {
+          statuses[name] = { status: "connected" };
+        }
+        log(
+          "updateConfig statuses: " +
+            Object.keys(incoming)
+              .map((name) => `${name}=${statuses[name]?.status || "missing"}`)
+              .join(", ")
+        );
+        result = { config: structuredClone(configs), statuses };
         break;
+      }
       default:
         throw new Error(`Unknown method: ${method}`);
     }
