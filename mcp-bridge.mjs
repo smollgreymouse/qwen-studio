@@ -22,8 +22,24 @@ import { createInterface } from "readline";
 const clients = new Map();
 const configs = {};
 
+// The Rust side waits 60s for any reply (src/mcp.rs `send`). A single server
+// that never answers `initialize` must not eat that whole budget, so every
+// handshake gets its own, smaller deadline and servers connect concurrently.
+const CONNECT_TIMEOUT_MS = 15000;
+
 function log(msg) {
   process.stderr.write(`[mcp-bridge] ${msg}\n`);
+}
+
+function withTimeout(promise, ms, label) {
+  let timer;
+  const guard = new Promise((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`${label} timed out after ${ms}ms`)),
+      ms
+    );
+  });
+  return Promise.race([promise, guard]).finally(() => clearTimeout(timer));
 }
 
 function reply(id, result) {
@@ -51,7 +67,19 @@ async function connect(params) {
       { capabilities: {} }
     );
 
-    await client.connect(transport, { timeout: 60000 });
+    try {
+      await withTimeout(
+        client.connect(transport, { timeout: CONNECT_TIMEOUT_MS }),
+        CONNECT_TIMEOUT_MS,
+        `connect ${serverName}`
+      );
+    } catch (e) {
+      // A timed-out handshake leaves the child process alive; reap it so hung
+      // servers do not pile up as orphans across config updates.
+      await Promise.resolve(transport.close()).catch(() => {});
+      throw e;
+    }
+
     clients.set(serverName, client);
     log(`connected: ${serverName}`);
     return { ok: true };
@@ -141,14 +169,14 @@ rl.on("line", async (line) => {
       case "updateConfig":
         await disconnectAll();
         Object.assign(configs, params.config || {});
-        for (const [name, cfg] of Object.entries(configs)) {
-          try {
-            await connect({ serverName: name, config: cfg });
-            log(`reconnected: ${name}`);
-          } catch (e) {
-            log(`reconnect FAILED ${name}: ${e.message}`);
-          }
-        }
+        // Concurrent on purpose: a hung server then costs a single
+        // CONNECT_TIMEOUT_MS instead of stalling every healthy server queued
+        // behind it.
+        await Promise.allSettled(
+          Object.entries(configs).map(([name, cfg]) =>
+            connect({ serverName: name, config: cfg })
+          )
+        );
         result = structuredClone(configs);
         break;
       default:

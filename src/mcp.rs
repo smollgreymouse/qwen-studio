@@ -263,20 +263,30 @@ fn get_default_config() -> HashMap<String, McpServerConfig> {
 fn normalize_config(
     mut config: HashMap<String, McpServerConfig>,
 ) -> HashMap<String, McpServerConfig> {
-    if cfg!(target_os = "linux") {
+    // The bundled Filesystem config ships with macOS/Linux paths. On any other
+    // OS those paths don't exist, `server-filesystem` refuses to start and the
+    // MCP menu shows the server as red — so rewrite them to real local paths.
+    if cfg!(target_os = "linux") || cfg!(target_os = "windows") {
         if let Some(fs_config) = config.get_mut("Filesystem") {
             let home_dir = dirs::home_dir()
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_else(|| "/tmp".to_string());
             let projects_dir = format!("{}/Projects", home_dir);
+            // Linux keeps `/tmp`; Windows has no such path, so use its temp dir.
+            let scratch_dir = if cfg!(target_os = "windows") {
+                std::env::temp_dir().to_string_lossy().to_string()
+            } else {
+                "/tmp".to_string()
+            };
 
-            // Replace macOS /Users paths with Linux home dir
             fs_config.args = fs_config
                 .args
                 .iter()
                 .map(|arg| {
                     if arg == "/Users" || arg.starts_with("/Users/") {
                         home_dir.clone()
+                    } else if arg == "/tmp" {
+                        scratch_dir.clone()
                     } else {
                         arg.clone()
                     }
@@ -292,9 +302,9 @@ fn normalize_config(
             if !has_projects {
                 fs_config.args.push(projects_dir);
             }
-            // Always include /tmp
-            if !fs_config.args.iter().any(|a| a == "/tmp") {
-                fs_config.args.push("/tmp".to_string());
+            // Always include a writable scratch dir
+            if !fs_config.args.iter().any(|a| a == &scratch_dir) {
+                fs_config.args.push(scratch_dir);
             }
         }
     }
@@ -633,5 +643,122 @@ mod tests {
             .expect("No tools");
         println!("Sequential-Thinking tools: {}", tools.len());
         assert!(!tools.is_empty(), "Should have sequential thinking tools");
+    }
+
+    // --- Windows path-normalization contracts (see feat/windows-build) ---
+    // The chat sends Filesystem configs with macOS/Linux paths (`/Users`, `/tmp`).
+    // On Windows those don't exist, so `server-filesystem` refuses to start and
+    // the MCP menu shows the server as red. normalize_config must rewrite them.
+
+    // Only args that look like filesystem paths are subject to existence checks;
+    // `-y` and `@scope/pkg` are npx flags/package names, not paths.
+    fn looks_like_path(arg: &str) -> bool {
+        arg.starts_with('/') || arg.starts_with("\\\\") || arg.as_bytes().get(1) == Some(&b':')
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_default_config_has_no_posix_tmp() {
+        let cfg = normalize_config(get_default_config());
+        let fs = cfg
+            .get("Filesystem")
+            .expect("default config must contain Filesystem");
+        for a in &fs.args {
+            assert_ne!(a, "/tmp", "posix /tmp leaked into windows config");
+            assert!(
+                !a.starts_with("/Users"),
+                "macOS /Users path leaked into windows config: {}",
+                a
+            );
+            if looks_like_path(a) {
+                assert!(
+                    std::path::Path::new(a).exists(),
+                    "Filesystem path arg must exist on windows: {}",
+                    a
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_normalize_replaces_mac_and_tmp_paths() {
+        let mut m = HashMap::new();
+        m.insert(
+            "Filesystem".to_string(),
+            McpServerConfig {
+                command: "npx".to_string(),
+                args: vec![
+                    "-y".to_string(),
+                    "@modelcontextprotocol/server-filesystem".to_string(),
+                    "/Users".to_string(),
+                    "/tmp".to_string(),
+                ],
+                transport_type: Some("stdio".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let out = normalize_config(m);
+        let fs = out.get("Filesystem").unwrap();
+
+        for a in &fs.args {
+            assert!(!a.starts_with("/Users"), "macOS path not replaced: {}", a);
+            assert_ne!(a, "/tmp", "posix /tmp not replaced");
+        }
+
+        let home = dirs::home_dir().unwrap().to_string_lossy().to_string();
+        let temp = std::env::temp_dir().to_string_lossy().to_string();
+        assert!(
+            fs.args.iter().any(|a| a == &home),
+            "home dir must be present after normalize: {:?}",
+            fs.args
+        );
+        assert!(
+            fs.args.iter().any(|a| a == &temp),
+            "temp dir must be present after normalize: {:?}",
+            fs.args
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_normalize_is_idempotent() {
+        let once = normalize_config(get_default_config());
+        let twice = normalize_config(once.clone());
+        assert_eq!(
+            once.get("Filesystem").unwrap().args,
+            twice.get("Filesystem").unwrap().args,
+            "normalizing twice must not duplicate or churn paths"
+        );
+    }
+
+    // Cross-platform invariant: a path that already exists on this OS must be
+    // preserved by normalize_config (we only rewrite known-bad posix paths).
+    #[test]
+    fn normalize_preserves_existing_valid_paths() {
+        let valid = std::env::temp_dir().to_string_lossy().to_string();
+        let mut m = HashMap::new();
+        m.insert(
+            "Filesystem".to_string(),
+            McpServerConfig {
+                command: "npx".to_string(),
+                args: vec![
+                    "-y".to_string(),
+                    "@modelcontextprotocol/server-filesystem".to_string(),
+                    valid.clone(),
+                ],
+                transport_type: Some("stdio".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let out = normalize_config(m);
+        let fs = out.get("Filesystem").unwrap();
+        assert!(
+            fs.args.iter().any(|a| a == &valid),
+            "valid existing path was dropped: {:?}",
+            fs.args
+        );
     }
 }
