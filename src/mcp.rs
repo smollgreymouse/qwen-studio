@@ -68,7 +68,7 @@ pub struct Bridge {
 
 impl Bridge {
     async fn new() -> Result<Self> {
-        let bridge_path = concat!(env!("CARGO_MANIFEST_DIR"), "/mcp-bridge.mjs");
+        let bridge_path = resolve_bridge_path();
 
         // Snapshot the environment the bridge will inherit: a GUI-launched app
         // and a shell-launched one can have very different PATHs, and "npx not
@@ -279,6 +279,50 @@ async fn read_bridge_stderr(stderr: tokio::process::ChildStderr) {
 
 pub type McpState = Arc<Mutex<Option<Arc<Bridge>>>>;
 
+/// Locate mcp-bridge.mjs.
+///
+/// In an installed (bundled) app the file ships as a bundle resource next to
+/// the executable; in a dev build it lives in the project root. The old
+/// CARGO_MANIFEST_DIR-only lookup baked the build machine's path into the
+/// binary, so the installed app could not find the bridge at all.
+fn resolve_bridge_path() -> String {
+    let candidates = [
+        // Bundled app: the bridge ships inside mcp-runtime/ next to its
+        // node_modules (ESM resolution walks up from the script's directory).
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("mcp-runtime").join("mcp-bridge.mjs"))),
+        // Dev build: project root.
+        Some(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("mcp-bridge.mjs")),
+    ];
+    for candidate in candidates.into_iter().flatten() {
+        if candidate.exists() {
+            return candidate.to_string_lossy().to_string();
+        }
+    }
+    // Fall back to the dev path so the spawn error names a real location.
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("mcp-bridge.mjs")
+        .to_string_lossy()
+        .to_string()
+}
+
+/// Locate the bundled MCP runtime (tsx + qwen-core) for the Windows qwen-core
+/// launcher. Installed apps ship it as the `mcp-runtime/` resource; dev builds
+/// use the project's own node_modules.
+fn mcp_runtime_dir() -> Option<std::path::PathBuf> {
+    let exe_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    let bundled = exe_dir.join("mcp-runtime");
+    if bundled.join("node_modules").exists() {
+        return Some(bundled);
+    }
+    let dev = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf();
+    if dev.join("node_modules").exists() {
+        return Some(dev);
+    }
+    None
+}
+
 fn get_default_config() -> HashMap<String, McpServerConfig> {
     let mut config = HashMap::new();
     let home_dir = dirs::home_dir()
@@ -324,24 +368,55 @@ fn get_default_config() -> HashMap<String, McpServerConfig> {
 /// The bundled qwen-core launcher (`npx -y qwen-core`) runs its `bin/qwen-core`
 /// shim, which does `child_process.spawn('npx', ['tsx', ...])` with no shell.
 /// On Windows there is no `npx.exe` (only `npx.cmd`), so that spawn dies with
-/// ENOENT and qwen-core comes up red. Run the TS entry point directly instead:
-/// `node <tsx cli> <qwen-core src/index.ts>`, resolved relative to this repo.
+/// ENOENT and qwen-core comes up red. Run the prebuilt entry point directly
+/// instead: `node <mcp-runtime>/node_modules/qwen-core/dist/index.mjs`, falling
+/// back to `node <tsx cli> <qwen-core src/index.ts>` for older versions that
+/// only ship TypeScript sources.
 #[cfg(windows)]
 fn qwen_core_config() -> McpServerConfig {
+    let mut args: Vec<String> = Vec::new();
+    if let Some(runtime) = mcp_runtime_dir() {
+        let dist = runtime
+            .join("node_modules")
+            .join("qwen-core")
+            .join("dist")
+            .join("index.mjs");
+        if dist.exists() {
+            args.push(dist.to_string_lossy().to_string());
+        } else {
+            let tsx = runtime
+                .join("node_modules")
+                .join("tsx")
+                .join("dist")
+                .join("cli.mjs");
+            let src = runtime
+                .join("node_modules")
+                .join("qwen-core")
+                .join("src")
+                .join("index.ts");
+            if tsx.exists() && src.exists() {
+                args.push(tsx.to_string_lossy().to_string());
+                args.push(src.to_string_lossy().to_string());
+            }
+        }
+    }
+    if args.is_empty() {
+        // No runtime found: keep the portable launcher and let the connect
+        // error explain itself instead of silently pointing at a dead path.
+        args = vec!["-y".to_string(), "qwen-core".to_string()];
+        return McpServerConfig {
+            command: "npx".to_string(),
+            args,
+            transport_type: Some("stdio".to_string()),
+            source: Some("official".to_string()),
+            from_: Some("builtin".to_string()),
+            disabled: false,
+            ..Default::default()
+        };
+    }
     McpServerConfig {
         command: "node".to_string(),
-        args: vec![
-            concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/node_modules/tsx/dist/cli.mjs"
-            )
-            .to_string(),
-            concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/node_modules/qwen-core/src/index.ts"
-            )
-            .to_string(),
-        ],
+        args,
         transport_type: Some("stdio".to_string()),
         source: Some("official".to_string()),
         from_: Some("builtin".to_string()),
